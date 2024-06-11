@@ -4,14 +4,16 @@ Problems commonly found when implementing concurrency and parallelism.
 
 Students:
 - Nguyen Thai Hoa 20224850
+- Nguyen Thai Khoi 20224868
 - Vu Tung Lam 20225140
+- Dao Phuc Long 20220034
 
 ## Concurrency
 In computer science, concurrency is the ability of different parts or units of a program, algorithm, or problem to be executed out-of-order or in partial order, without affecting the outcome. This allows for parallel execution of the concurrent units, which can significantly improve overall speed of the execution in multi-processor and multi-core systems. In more technical terms, concurrency refers to the decomposability of a program, algorithm, or problem into order-independent or partially-ordered components or units of computation.
 
 According to Rob Pike, concurrency is the composition of independently executing computations, and concurrency is not parallelism: concurrency is about dealing with lots of things at once but parallelism is about doing lots of things at once. Concurrency is about structure, parallelism is about execution, concurrency provides a way to structure a solution to solve a problem that may (but not necessarily) be parallelizable.
 
-The following table compares the differences between different forms of execution.
+The following table compares the differences between different forms of execution in a multi-core machine.
 
 |             | Singlethreading (synchronous) | Singlethreading (asynchronous) | Multithreading | Multiprocessing |
 | ----------- | :---------------------------: | :----------------------------: | :------------: | :-------------: |
@@ -48,6 +50,162 @@ When multiple threads are waiting for the semaphore, they will be put in a FIFO 
 
 If the internal counter of the semaphore has an upper limit of 1, it is identical to a lock.
 
+### Condition
+
+A condition variable is always associated with some kind of lock; this can be passed in or one will be created by default. Passing one in is useful when several condition variables must share the same lock. The lock is part of the condition object: we do not have to track it separately.
+
+Other methods must be called with the associated lock held. The `wait()` method releases the lock, and then blocks until another thread awakens it by calling `notify()` or `notify_all()`. Once awakened, `wait()` re-acquires the lock and returns. It is also possible to specify a timeout.
+
+The `notify()` method wakes up one of the threads waiting for the condition variable, if any are waiting. The `notify_all()` method wakes up all threads waiting for the condition variable.
+
+Note: the `notify()` and `notify_all()` methods do not release the lock; this means that the thread or threads awakened will not return from their `wait()` call immediately, but only when the thread that called `notify()` or `notify_all()` finally relinquishes ownership of the lock.
+
+The typical programming style using condition variables uses the lock to synchronize access to some shared state; threads that are interested in a particular change of state call `wait()` repeatedly until they see the desired state, while threads that modify the state call `notify()` or `notify_all()` when they change the state in such a way that it could possibly be a desired state for one of the waiters. For example, the following code is a generic producer-consumer situation with unlimited buffer capacity:
+
+```cpp
+Condition condition = Condition(Lock());
+
+// Consume one item
+condition.acquire();
+while (!an_item_is_available())
+{
+    condition.wait();
+}
+get_an_available_item();
+condition.release();
+
+// Produce one item
+condition.acquire();
+make_an_item_available();
+condition.notify();
+condition.release();
+```
+
+## Implementation
+
+All testing are done using C++17 (compiled with the `-O0` flag). We utilize the semaphore and event objects from the win32 C++ API and wrap in custom classes like below:
+
+Wrapper class for `Event` objects:
+```cpp
+class Event
+{
+private:
+    HANDLE _event;
+
+public:
+    Event(bool flag) : _event(CreateEventW(NULL, TRUE, flag, NULL)) {}
+    ~Event()
+    {
+        CloseHandle(_event);
+    }
+
+    void set() const
+    {
+        SetEvent(_event);
+    }
+
+    void clear() const
+    {
+        ResetEvent(_event);
+    }
+
+    void wait() const
+    {
+        WaitForSingleObject(_event, INFINITE);
+    }
+};
+```
+
+Wrapper class for `Semaphore` and `Lock` objects:
+```cpp
+class Semaphore
+{
+private:
+    HANDLE _semaphore;
+
+public:
+    Semaphore(int count) : _semaphore(CreateSemaphoreW(NULL, count, count, NULL)) {}
+    ~Semaphore()
+    {
+        CloseHandle(_semaphore);
+    }
+
+    void acquire() const
+    {
+        WaitForSingleObject(_semaphore, INFINITE);
+    }
+
+    void release(LONG count = 1) const
+    {
+        ReleaseSemaphore(_semaphore, count, NULL);
+    }
+};
+
+class Lock : public Semaphore
+{
+public:
+    Lock() : Semaphore(1) {}
+
+    void release() const
+    {
+        Semaphore::release();
+    }
+};
+```
+
+Additionally, we implement a `Condition` class as below:
+```cpp
+class Condition
+{
+private:
+    const Lock *_lock;
+    std::deque<Lock> _waiters;
+
+public:
+    Condition(const Lock *lock) : _lock(lock) {}
+
+    void acquire()
+    {
+        _lock->acquire();
+    }
+
+    void release()
+    {
+        _lock->release();
+    }
+
+    void wait()
+    {
+        Lock waiter = Lock();
+        waiter.acquire();
+        _waiters.push_back(waiter);
+
+        release();
+        waiter.acquire();
+    }
+
+    void notify(int n)
+    {
+        for (int i = 0; i < n; i++)
+        {
+            if (_waiters.empty())
+            {
+                return;
+            }
+
+            auto front = _waiters.front();
+            _waiters.pop_front();
+            front.release();
+        }
+    }
+
+    void notify_all()
+    {
+        notify(_waiters.size());
+    }
+};
+```
+
 ## ABA Problem
 
 The ABA problem is a subtle challenge that can arise in multithreaded programming when dealing with shared memory. It occurs during synchronization, specifically when relying solely on a variable's current value to determine if data has been modified.
@@ -73,11 +231,6 @@ The ABA problem occurs when multiple threads (or processes) accessing shared dat
 An example illustrating how the ABA problem occurs:
 
 ```cpp
-#include <atomic>
-#include <iostream>
-#include <stdexcept>
-#include <windows.h>
-
 class __StackNode
 {
 public:
@@ -354,8 +507,8 @@ Here is the description for this problem
   1. One smoker has an infinite supply of tobacco.
   2. Another smoker has an infinite supply of paper.
   3. The third smoker has an infinite supply of matches.
-* **Non-smoking Agent:** There is also a non-smoking agent who enables the smokers to make their cigarettes. The agent randomly selects two of the supplies and places them on the table.
-* **Smoking Process:**
+* **Non-smoking agent:** There is also a non-smoking agent who enables the smokers to make their cigarettes. The agent randomly selects two of the supplies and places them on the table.
+* **Smoking process:**
   1. The smoker who has the third supply should remove the two items from the table.
   2. They use these items (along with their own supply) to make a cigarette, which they smoke for a while.
   3. Once the smoker finishes smoking, the agent places two new random items on the table.
@@ -363,30 +516,27 @@ Here is the description for this problem
 
 ### Example
 
-```cpp
-#include <chrono>
-#include <iostream>
-#include <random>
-#include <windows.h>
+A naive implementation given below, where each smoker waits for the other 2, will easily suffer from deadlock.
 
+```cpp
 std::mt19937 rng(std::chrono::steady_clock::now().time_since_epoch().count());
 
 template <typename T>
-T random_int(const T l, const T r)
+T random_int(const T &l, const T &r)
 {
     std::uniform_int_distribution<T> unif(l, r);
     return unif(rng);
 }
 
-HANDLE smoking;
-std::vector<HANDLE> semaphores;
+const Lock smoking = Lock();
+std::vector<Lock> locks(3);
 
-void synchronization_primitives()
+void initialize()
 {
-    smoking = CreateSemaphoreW(NULL, 0, 1, NULL);
+    smoking.acquire();
     for (int i = 0; i < 3; i++)
     {
-        semaphores.push_back(CreateSemaphoreW(NULL, 0, 1, NULL));
+        locks[i].acquire();
     }
 }
 
@@ -397,9 +547,9 @@ DWORD WINAPI agent(void *)
         int ingredient = random_int(0, 2), next_ingredient = (1 + ingredient) % 3;
         std::cout << "Got ingredients " << ingredient << ", " << next_ingredient << std::endl;
 
-        ReleaseSemaphore(semaphores[ingredient], 1, NULL);
-        ReleaseSemaphore(semaphores[next_ingredient], 1, NULL);
-        WaitForSingleObject(smoking, INFINITE);
+        locks[ingredient].release();
+        locks[next_ingredient].release();
+        smoking.acquire();
     }
 
     return 0;
@@ -410,14 +560,17 @@ DWORD WINAPI smoker(void *ptr)
     int ingredient = *(int *)ptr;
     while (true)
     {
-        WaitForSingleObject(semaphores[(ingredient + 1) % 3], INFINITE);
+        locks[(ingredient + 1) % 3].acquire();
         std::cout << "Smoker " << ingredient << " got " << (ingredient + 1) % 3 << std::endl;
-        WaitForSingleObject(semaphores[(ingredient + 2) % 3], INFINITE);
+
+        locks[(ingredient + 2) % 3].acquire();
         std::cout << "Smoker " << ingredient << " got " << (ingredient + 2) % 3 << std::endl;
+
         std::cout << "Smoker " << ingredient << " is smoking" << std::endl;
         Sleep(500);
         std::cout << "Smoker " << ingredient << " is done" << std::endl;
-        ReleaseSemaphore(smoking, 1, NULL);
+
+        smoking.release();
     }
 
     return 0;
@@ -425,7 +578,7 @@ DWORD WINAPI smoker(void *ptr)
 
 int main()
 {
-    synchronization_primitives();
+    initialize();
 
     std::vector<HANDLE> threads;
     threads.push_back(
@@ -442,15 +595,7 @@ int main()
     for (int i = 0; i < 3; i++)
     {
         ingredient_ptr[i] = new int(i);
-        threads.push_back(
-            CreateThread(
-                NULL,              // lpThreadAttributes
-                0,                 // dwStackSize
-                &smoker,           // lpStartAddress
-                ingredient_ptr[i], // lpParameter
-                0,                 // dwCreationFlags
-                NULL)              // lpThreadId
-        );
+        threads.push_back(CreateThread(NULL, 0, &smoker, ingredient_ptr[i], 0, NULL));
     }
 
     for (auto &thread : threads)
@@ -468,30 +613,272 @@ int main()
 }
 ```
 
-In the example above, The `agent` thread randomly places two ingredients on the table. Each `smoker` thread waits for the required ingredients, makes a cigarette, smokes it, and then signals the agent to continue.
-
 ### Real-world implications
 
 The Cigarette Smokers Problem in computer science, beyond being a theoretical exercise, has real-world implications, particularly in the field of concurrent programming and operating systems. Here are some of the key implications:
-* **Deadlock Prevention** The problem demonstrates a scenario where deadlock can occur if resources are not managed properly. In real-world systems, such as databases and operating systems, managing access to shared resources is crucial to prevent deadlock, which can cause systems to halt or become unresponsive.
-* **Resource Allocation** It illustrates the challenges in allocating limited resources among competing processes or threads. This is analogous to real-world situations where multiple applications or users require access to a finite set of resources, such as CPU time, memory, or network bandwidth.
-* **Synchronization Mechanisms** The problem highlights the importance of proper synchronization mechanisms, like semaphores, locks, and condition variables, to coordinate the actions of concurrent processes. These mechanisms are widely used in developing multi-threaded applications, ensuring that processes operate in the correct sequence without interfering with each other.
-* **System Design** It emphasizes the need for careful system design to avoid complex interdependencies that can lead to deadlock. This is relevant for designing systems that are robust, scalable, and maintainable.
-* **Understanding Concurrency** The problem serves as an educational tool to help programmers understand the complexities of concurrency, which is essential for developing efficient and reliable software in a multi-core and distributed computing world.
-* **Semaphore Limitations** The problem also points out the limitations of traditional semaphores and the need for more powerful synchronization primitives in certain scenarios.
+* **Deadlock prevention** The problem demonstrates a scenario where deadlock can occur if resources are not managed properly. In real-world systems, such as databases and operating systems, managing access to shared resources is crucial to prevent deadlock, which can cause systems to halt or become unresponsive.
+* **Resource allocation** It illustrates the challenges in allocating limited resources among competing processes or threads. This is analogous to real-world situations where multiple applications or users require access to a finite set of resources, such as CPU time, memory, or network bandwidth.
+* **Synchronization mechanisms** The problem highlights the importance of proper synchronization mechanisms, like semaphores, locks, and condition variables, to coordinate the actions of concurrent processes. These mechanisms are widely used in developing multi-threaded applications, ensuring that processes operate in the correct sequence without interfering with each other.
+* **System design** It emphasizes the need for careful system design to avoid complex interdependencies that can lead to deadlock. This is relevant for designing systems that are robust, scalable, and maintainable.
+* **Understanding concurrency** The problem serves as an educational tool to help programmers understand the complexities of concurrency, which is essential for developing efficient and reliable software in a multi-core and distributed computing world.
+* **Semaphore limitations** The problem also points out the limitations of traditional semaphores and the need for more powerful synchronization primitives in certain scenarios.
 
 ### Addressing the Cigarette Smokers Problem
 
 Several approaches can help mitigate the Cigarette Smokers Problem:
-* **Deadlock Avoidance:** Implement a deadlock avoidance strategy to prevent the system from entering a deadlock state.
-* **Priority-Based Allocation:** Assign priorities to processes or threads. When allocating resources, give preference to higher-priority processes. This helps prevent low-priority processes from blocking critical resources indefinitely.
-* **Resource Pooling:** Create a pool of resources (e.g., semaphores or locks) that processes can request. When a process is done, it releases the resource back to the pool. This avoids resource exhaustion and ensures fair access.
-* **Two-Phase Locking:** In database management systems, use two-phase locking to ensure that transactions acquire and release locks in a consistent order. This helps prevent deadlocks during data updates.
-* **Timeouts and Rollbacks:** If a process waits too long for a resource, introduce a timeout. If the timeout expires, the process releases its resources and rolls back its work. This prevents indefinite waiting.
-* **Resource Hierarchies:** Assign a hierarchy to resources (e.g., locks). Processes must acquire resources in a specific order (from lower to higher levels). This prevents circular waits.
-* **Dynamic Resource Allocation:** Dynamically allocate resources based on demand. For example, allocate memory or threads as needed and release them when no longer required.
-* **Avoidance of Hold-and-Wait:** Processes should request all required resources upfront (non-preemptive). If a process cannot acquire all resources, it releases any acquired resources and retries later.
+* **Deadlock avoidance:** Implement a deadlock avoidance strategy to prevent the system from entering a deadlock state.
+* **Priority-based allocation:** Assign priorities to processes or threads. When allocating resources, give preference to higher-priority processes. This helps prevent low-priority processes from blocking critical resources indefinitely.
+* **Resource pooling:** Create a pool of resources (e.g., semaphores or locks) that processes can request. When a process is done, it releases the resource back to the pool. This avoids resource exhaustion and ensures fair access.
+* **Two-phase locking:** In database management systems, use two-phase locking to ensure that transactions acquire and release locks in a consistent order. This helps prevent deadlocks during data updates.
+* **Timeouts and rollbacks:** If a process waits too long for a resource, introduce a timeout. If the timeout expires, the process releases its resources and rolls back its work. This prevents indefinite waiting.
+* **Resource hierarchies:** Assign a hierarchy to resources (e.g., locks). Processes must acquire resources in a specific order (from lower to higher levels). This prevents circular waits.
+* **Dynamic resource allocation:** Dynamically allocate resources based on demand. For example, allocate memory or threads as needed and release them when no longer required.
+* **Avoidance of hold-and-wait:** Processes should request all required resources upfront (non-preemptive). If a process cannot acquire all resources, it releases any acquired resources and retries later.
 * **Preemption:** If a high-priority process needs a resource held by a lower-priority process, preempt the lower-priority process and allocate the resource to the higher-priority one.
-* **Transaction Serialization:** In database systems, ensure that transactions are serialized (executed one after the other) to avoid conflicts and deadlocks.
+* **Transaction serialization:** In database systems, ensure that transactions are serialized (executed one after the other) to avoid conflicts and deadlocks.
 
 In summary, the Cigarette Smokers Problem is not just a theoretical construct but a representation of the real challenges faced in concurrent programming and system design. It encourages developers to think critically about process synchronization, resource allocation, and system robustness in the context of concurrent operations.
+
+### Barrier Synchronization Problem
+
+Barrier synchronization problems arise in parallel computing when multiple threads or processes must reach a synchronization point (or barrier) at the same time. The primary purpose of a barrier is to ensure that no thread or process proceeds beyond a certain point until all others have reached that point. However, various issues can occur with this synchronization mechanism:
+
+#### Detailed explanation
+
+1. **Uneven workload distribution**:
+   - **Problem**: If the workload is unevenly distributed among threads, some threads may finish their tasks much earlier than others and wait idly at the barrier, leading to inefficient use of resources.
+   - **Example**: In a parallel algorithm where each thread processes a portion of an array, if some portions take significantly longer to process than others, faster threads will spend time waiting at the barrier.
+
+2. **Straggler effect**:
+   - **Problem**: A single slow thread (straggler) can delay the entire batch of threads at the barrier, causing performance degradation.
+   - **Example**: In a distributed system, if one node is slower due to network latency or lower processing power, it will cause all other nodes to wait, affecting overall system performance.
+
+3. **Resource contention**:
+   - **Problem**: When multiple threads converge on a barrier, there can be contention for the resources managing the barrier (e.g., locks or semaphores), potentially leading to performance bottlenecks.
+   - **Example**: If a barrier implementation uses a shared lock, contention for this lock can increase as the number of threads grows, leading to increased wait times.
+
+4. **Deadlock**:
+   - **Problem**: Incorrectly implemented barriers can lead to deadlocks, where threads are permanently blocked waiting at the barrier due to a logical error in the synchronization code.
+   - **Example**: If a barrier is supposed to synchronize 10 threads but is mistakenly programmed to wait for 11, all threads will wait indefinitely, causing a deadlock.
+
+5. **Livelock**:
+   - **Problem**: Although less common, livelock can occur if threads constantly change state in response to each other without making progress through the barrier.
+   - **Example**: Threads repeatedly entering and leaving the barrier due to incorrect signaling can lead to livelock, where no thread progresses past the barrier.
+
+6. **Complexity in nested barriers**:
+   - **Problem**: In complex programs with nested barriers, ensuring correct synchronization can be challenging and prone to errors, leading to unexpected behavior.
+   - **Example**: If an outer barrier depends on the completion of an inner barrier, and there's a misconfiguration, threads may be incorrectly synchronized, causing logic errors.
+
+7. **High overhead**:
+   - **Problem**: The overhead associated with managing barriers can become significant, especially in systems with a large number of threads, leading to performance issues.
+   - **Example**: The time taken to manage and coordinate the barrier increases with the number of participating threads, reducing the benefits of parallelism.
+
+#### Solutions and best practices
+
+1. **Dynamic load balancing**:
+   - Implement dynamic load balancing to ensure more even distribution of work among threads, reducing the likelihood of uneven workload distribution.
+
+2. **Hierarchical barriers**:
+   - Use hierarchical barriers that synchronize threads in smaller groups before synchronizing the entire set, reducing contention and overhead.
+
+3. **Timeout mechanisms**:
+   - Implement timeout mechanisms to detect and handle situations where threads are waiting too long at a barrier, potentially indicating a problem like a deadlock.
+
+4. **Profiling and optimization**:
+   - Profile the application to identify bottlenecks and optimize the code to reduce the time threads spend waiting at barriers.
+
+5. **Efficient barrier implementations**:
+   - Use efficient barrier implementations that minimize contention and overhead, such as tree-based barriers or software combining trees.
+
+6. **Graceful degradation**:
+   - Design the system to handle stragglers gracefully, allowing other threads to perform useful work while waiting.
+
+By understanding and addressing these issues, developers can design more efficient and robust parallel programs that make effective use of barrier synchronization.
+
+### Atomicity violation
+
+Atomicity violations occur when a sequence of operations that should be executed as a single, indivisible (atomic) operation are interrupted by other threads, leading to inconsistent or incorrect results. This issue is common in concurrent programming, where multiple threads access and modify shared data.
+
+#### Detailed explanation
+
+1. **Definition of atomicity**:
+   - **Atomic operation**: An operation or a set of operations that are performed as a single unit without interference from other operations. Either all operations are executed, or none are, ensuring data consistency.
+
+2. **Common scenarios for atomicity violations**:
+   - **Check-then-act**: A thread checks a condition and then acts based on the result, but another thread changes the condition in between.
+   - **Read-modify-write**: A thread reads a value, modifies it, and writes it back, but another thread modifies the value in between the read and write steps.
+
+3. **Example scenarios**:
+   - **Bank account example**:
+     - Suppose two threads are transferring money from a shared bank account. The first thread checks the balance to ensure there are sufficient funds before making a transfer, while the second thread is simultaneously transferring money out. Without synchronization, both threads could read the same initial balance and proceed with the transfer, resulting in an overdrawn account.
+   - **Counter increment example**:
+     - Consider two threads incrementing a shared counter. Both threads read the current value, increment it, and write it back. Without synchronization, both threads might read the same value, increment it, and write back the same result, causing one increment to be lost.
+
+4. **Consequences of atomicity violations**:
+   - **Data corruption**: Shared data can become inconsistent or corrupted.
+   - **Incorrect program behavior**: The program may produce incorrect results or exhibit unexpected behavior.
+   - **Security vulnerabilities**: In some cases, atomicity violations can lead to security issues, such as race conditions exploited by attackers.
+
+5. **Detection and debugging**:
+   - **Testing and debugging**: Atomicity violations can be difficult to detect through testing because they may only occur under specific timing conditions. Tools like thread analyzers and race condition detectors can help identify these issues.
+   - **Code review**: Careful code review and understanding of concurrent programming principles can help spot potential atomicity violations.
+
+6. **Preventive measures and solutions**:
+   - **Locks (mutexes)**:
+     - Use locks to ensure that a sequence of operations is executed atomically. For example, acquire a lock before checking and modifying a shared variable and release it afterward.
+   - **Atomic operations**:
+     - Use atomic operations provided by the programming language or library (e.g., `AtomicInteger` in Java, `std::atomic` in C++) to perform atomic read-modify-write operations.
+   - **Transaction memory**:
+     - Utilize transactional memory systems where a series of read and write operations are grouped into a transaction, ensuring atomicity.
+   - **Higher-level concurrency constructs**:
+     - Use higher-level constructs like semaphores, barriers, or synchronized collections that manage synchronization internally to prevent atomicity violations.
+   - **Volatile keyword**:
+     - In languages like Java, use the `volatile` keyword to ensure visibility and ordering of changes to a variable across threads, though this alone does not ensure atomicity.
+
+7. **Programming practices**:
+   - **Minimize shared data**: Reduce the amount of shared data that needs to be accessed concurrently.
+   - **Immutable objects**: Use immutable objects to avoid the need for synchronization on shared data.
+   - **Design for concurrency**: Design the application with concurrency in mind from the start, considering how threads will interact with shared resources.
+
+## Other problems
+
+### Crossing the river
+You have been hired to coordinate people trying to cross a river. There is only a single boat, capable of holding at most three people. The boat will sink if more than three people board it at a time. Each person is modeled as a separate thread, executing the function below:
+
+```cpp
+void Person(int index, int location)
+// location is either 0 or 1;
+// 0 = left bank, 1 = right bank of the river
+{
+    ArriveAtBoat(index, location);
+    BoardBoatAndCrossRiver(location);
+    GetOffOfBoat(index, location);
+}
+```
+
+Synchronization is to be done using monitors and condition variables in the two procedures `ArriveAtBoat` and `GetOffOfBoat`. Provide the code for `ArriveAtBoat` and `GetOffOfBoat`. The `BoardBoatAndCrossRiver` procedure is not of interest in this problem since it has no role in synchronization. `ArriveAtBoat` must not return until it safe for the person to cross the river in the given direction (it must guarantee that the boat will not sink, and that no one will step off the pier into the river when the boat is on the opposite bank). `GetOffOfBoat` is called to indicate that the caller has finished crossing the river; it can take steps to let other people cross the river.
+
+#### Solution
+
+```cpp
+class Boat
+{
+private:
+    int _location = 0;
+
+    std::vector<int> _load;
+    std::vector<Condition> _conditions;
+
+    const Lock _global_lock = Lock();
+
+public:
+    const int CAPACITY = 3;
+
+    Boat()
+    {
+        for (int i = 0; i < 2; i++)
+        {
+            _conditions.push_back(Condition(&_global_lock));
+        }
+    }
+
+    void board(int index, int location)
+    {
+        _global_lock.acquire();
+
+        while (location != _location || _load.size() == 3)
+        {
+            _conditions[location].wait();
+        }
+
+        std::stringstream ss;
+        ss << "Person " << index << " boarded: " << location << " -> " << 1 - location << "\n";
+        std::cout << ss.str();
+
+        _load.push_back(index);
+        _global_lock.release();
+    }
+
+    void get_off(int index, int location)
+    {
+        _global_lock.acquire();
+
+        std::stringstream ss;
+        ss << "Person " << index << " got off: " << location << " -> " << 1 - location << "\n";
+        std::cout << ss.str();
+
+        _load.pop_back();
+        if (_load.empty())
+        {
+            _location = 1 - _location;
+            _conditions[_location].notify_all();
+        }
+
+        _global_lock.release();
+    }
+};
+
+const int PEOPLE_COUNT = 4;
+Boat boat;
+
+void ArriveAtBoat(int index, int location)
+{
+    boat.board(index, location);
+}
+
+void GetOffOfBoat(int index, int location)
+{
+    boat.get_off(index, location);
+}
+
+void BoardBoatAndCrossRiver(int location)
+{
+}
+
+void Person(int index, int location)
+// location is either 0 or 1;
+// 0 = left bank, 1 = right bank of the river
+{
+    ArriveAtBoat(index, location);
+    BoardBoatAndCrossRiver(location);
+    GetOffOfBoat(index, location);
+}
+
+DWORD WINAPI routine(void *_index)
+{
+    int index = *(int *)_index, location = 0;
+    while (true)
+    {
+        std::stringstream ss;
+        ss << "Person " << index << " at " << location << "\n";
+        std::cout << ss.str();
+
+        Person(index, location);
+        location = 1 - location;
+    }
+}
+
+int main()
+{
+    std::vector<HANDLE> threads;
+    for (int i = 0; i < PEOPLE_COUNT; i++)
+    {
+        threads.push_back(CreateThread(NULL, 0, &routine, new int(i), 0, NULL)); // ignore memory leak
+    }
+
+    WaitForMultipleObjects(threads.size(), &threads[0], TRUE, INFINITE);
+    return 0;
+}
+```
+
+Note that this solution may lead to starvation. The readers is encouraged to develop a starvation-free solution. 
+
+## References
+
+- https://en.wikipedia.org/wiki/ABA_problem
+- https://pub.dev/documentation/async_locks/latest/async_locks/async_locks-library.html
+- https://docs.python.org/3/library/threading.html
+- https://en.wikipedia.org/wiki/Sleeping_barber_problem
+- https://en.wikipedia.org/wiki/Cigarette_smokers_problem
+- https://www.cis.upenn.edu/~devietti/papers/lucia.atomaid.toppicks.2009.pdf
+- https://www.cs.cornell.edu/courses/cs4410/2010fa/synchreview.pdf
